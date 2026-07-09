@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Deck Controller</title>
+<style>
+  :root {
+    --bg: #0e1013; --panel: #16191e; --line: #262b33;
+    --text: #d8dce2; --dim: #6b7280;
+    --tally: #ff3b30; --tally-glow: rgba(255,59,48,.35);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.4 system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; height: 100dvh; }
+
+  header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line);
+    font: 600 13px/1 ui-monospace, monospace; letter-spacing: .04em;
+  }
+  #tally {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #2e343d; flex: none; transition: background .15s, box-shadow .15s;
+  }
+  #tally.live { background: var(--tally); box-shadow: 0 0 10px 3px var(--tally-glow); }
+  #driver { color: var(--dim); font-weight: 400; margin-left: auto; text-align: right; }
+
+  #preview { flex: 1; display: flex; align-items: center; justify-content: center;
+    padding: 12px; min-height: 0; }
+  #preview canvas { max-width: 100%; max-height: 100%; border: 1px solid var(--line);
+    background: #000; }
+
+  #counter { text-align: center; font: 600 15px/1 ui-monospace, monospace;
+    color: var(--dim); padding-bottom: 6px; }
+  #counter b { color: var(--text); }
+
+  #transport { display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+    padding: 0 12px 10px; }
+  #transport button {
+    height: 84px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--panel); color: var(--text); font-size: 30px;
+    cursor: pointer; touch-action: manipulation;
+  }
+  #transport button:active { background: #1f242c; }
+
+  #thumbs { display: flex; gap: 8px; overflow-x: auto; padding: 0 12px 14px; flex: none; }
+  #thumbs canvas { height: 64px; border: 1px solid var(--line); border-radius: 4px;
+    cursor: pointer; flex: none; background: #000; }
+  #thumbs canvas.active { border-color: var(--tally); }
+
+  #conn { position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 12px; font-size: 12px; color: var(--dim); display: none; }
+</style>
+</head>
+<body>
+<header>
+  <div id="tally"></div>
+  <span id="roomLabel"></span>
+  <span id="driver"></span>
+</header>
+<div id="preview"><canvas id="main"></canvas></div>
+<div id="counter">— / —</div>
+<div id="transport">
+  <button id="prev" aria-label="Previous page">‹</button>
+  <button id="next" aria-label="Next page">›</button>
+</div>
+<div id="thumbs"></div>
+<div id="conn">connecting…</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script>
+// ── EDIT THESE TWO LINES ─────────────────────────────────────
+const SUPABASE_URL = "https://ltmoomstlyyzsdmvydqr.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx0bW9vbXN0bHl5enNkbXZ5ZHFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM1ODI4NzksImV4cCI6MjA5OTE1ODg3OX0.xt9sA-h009_ITyoiUKNn9Hqj2nDz8qor5zlQ6wuKowU";
+// ─────────────────────────────────────────────────────────────
+// Usage: controller.html?room=webinar1&pdf=https://host/deck.pdf&name=Andrii
+
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const params = new URLSearchParams(location.search);
+const room = params.get("room") || "default";
+const pdfUrl = params.get("pdf");
+let myName = params.get("name") || localStorage.getItem("deckName");
+if (!myName) {
+  myName = prompt("Your name (shown to co-presenters):") || "presenter";
+  localStorage.setItem("deckName", myName);
+}
+
+document.getElementById("roomLabel").textContent = "ROOM " + room.toUpperCase();
+const connEl = document.getElementById("conn");
+connEl.style.display = "block";
+
+const mainCanvas = document.getElementById("main");
+const mainCtx = mainCanvas.getContext("2d");
+const counterEl = document.getElementById("counter");
+const driverEl = document.getElementById("driver");
+const tallyEl = document.getElementById("tally");
+const thumbsEl = document.getElementById("thumbs");
+
+let pdfDoc = null, currentPage = 1, renderTask = null, tallyTimer = null;
+
+async function renderMain(n) {
+  const page = await pdfDoc.getPage(n);
+  const dpr = window.devicePixelRatio || 1;
+  const box = document.getElementById("preview");
+  const base = page.getViewport({ scale: 1 });
+  const scale = Math.min(
+    (box.clientWidth - 24) / base.width,
+    (box.clientHeight - 24) / base.height
+  ) * dpr;
+  const vp = page.getViewport({ scale });
+  mainCanvas.width = vp.width; mainCanvas.height = vp.height;
+  mainCanvas.style.width = vp.width / dpr + "px";
+  mainCanvas.style.height = vp.height / dpr + "px";
+  if (renderTask) renderTask.cancel();
+  renderTask = page.render({ canvasContext: mainCtx, viewport: vp });
+  try { await renderTask.promise; } catch (e) {}
+}
+
+function setPage(n, who) {
+  if (!pdfDoc) return;
+  n = Math.max(1, Math.min(n, pdfDoc.numPages));
+  currentPage = n;
+  renderMain(n);
+  counterEl.innerHTML = "<b>" + n + "</b> / " + pdfDoc.numPages;
+  [...thumbsEl.children].forEach((c, i) => c.classList.toggle("active", i + 1 === n));
+  thumbsEl.children[n - 1]?.scrollIntoView({ inline: "center", behavior: "smooth" });
+  if (who) {
+    driverEl.textContent = who === myName ? "you're driving" : who + " is driving";
+    tallyEl.classList.toggle("live", who === myName);
+    clearTimeout(tallyTimer);
+    tallyTimer = setTimeout(() => tallyEl.classList.remove("live"), 5000);
+  }
+}
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const channel = sb.channel("deck:" + room, { config: { broadcast: { self: false } } });
+
+function go(n) {
+  setPage(n, myName);
+  channel.send({ type: "broadcast", event: "goto",
+    payload: { page: currentPage, who: myName } });
+}
+
+channel
+  .on("broadcast", { event: "goto" }, ({ payload }) => setPage(payload.page, payload.who))
+  .on("broadcast", { event: "sync-request" }, () => {
+    // any controller answers; identical answers are harmless
+    channel.send({ type: "broadcast", event: "goto",
+      payload: { page: currentPage, who: driverEl.textContent ? undefined : myName } });
+  })
+  .subscribe(async (state) => {
+    if (state !== "SUBSCRIBED") return;
+    connEl.style.display = "none";
+    if (!pdfUrl) { connEl.textContent = "missing ?pdf= parameter"; connEl.style.display = "block"; return; }
+    pdfDoc = await pdfjsLib.getDocument(pdfUrl).promise;
+    await buildThumbs();
+    setPage(1);
+    channel.send({ type: "broadcast", event: "sync-request", payload: {} });
+  });
+
+async function buildThumbs() {
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    const page = await pdfDoc.getPage(i);
+    const vp = page.getViewport({ scale: 128 / page.getViewport({ scale: 1 }).height });
+    const c = document.createElement("canvas");
+    c.width = vp.width; c.height = vp.height;
+    await page.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+    c.onclick = () => go(i);
+    thumbsEl.appendChild(c);
+  }
+}
+
+document.getElementById("prev").onclick = () => go(currentPage - 1);
+document.getElementById("next").onclick = () => go(currentPage + 1);
+addEventListener("keydown", (e) => {
+  if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") go(currentPage + 1);
+  if (e.key === "ArrowLeft" || e.key === "PageUp") go(currentPage - 1);
+});
+</script>
+</body>
+</html>
