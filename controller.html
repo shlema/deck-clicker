@@ -29,8 +29,16 @@
 
   #preview { flex: 1; display: flex; align-items: center; justify-content: center;
     padding: 12px; min-height: 0; }
-  #preview canvas { max-width: 100%; max-height: 100%; border: 1px solid var(--line);
-    background: #000; }
+  #sheet { position: relative; border: 1px solid var(--line); background: #000; }
+  #sheet canvas { display: block; }
+  #ink { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #ink.armed { pointer-events: auto; cursor: crosshair; touch-action: none;
+    -webkit-user-select: none; user-select: none; }
+
+  #pen { font: 600 12px/1 ui-monospace, monospace; letter-spacing: .04em;
+    padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--panel); color: var(--dim); cursor: pointer; }
+  #pen.on { color: #0e1013; background: var(--pen); border-color: var(--pen); }
 
   #counter { text-align: center; font: 600 15px/1 ui-monospace, monospace;
     color: var(--dim); padding-bottom: 6px; }
@@ -60,8 +68,9 @@
   <div id="tally"></div>
   <span id="roomLabel"></span>
   <span id="driver"></span>
+  <button id="pen" aria-pressed="false">✎ DRAW</button>
 </header>
-<div id="preview"><canvas id="main"></canvas></div>
+<div id="preview"><div id="sheet"><canvas id="main"></canvas><canvas id="ink"></canvas></div></div>
 <div id="counter">— / —</div>
 <div id="transport">
   <button id="prev" aria-label="Previous page">‹</button>
@@ -104,6 +113,49 @@ const thumbsEl = document.getElementById("thumbs");
 
 let pdfDoc = null, currentPage = 1, renderTask = null, tallyTimer = null;
 
+// ── Ink overlay: fading strokes, coordinates normalized 0..1 ──
+const INK_HOLD = 2500, INK_FADE = 1000;   // ms visible, then ms fading out
+const inkCanvas = document.getElementById("ink");
+const inkCtx = inkCanvas.getContext("2d");
+const strokes = new Map();                // id -> { color, pts, t }
+let inkRaf = null;
+
+function drawInk() {
+  inkRaf = null;
+  const now = performance.now();
+  const w = inkCanvas.width, h = inkCanvas.height, lw = h * 0.006;
+  inkCtx.clearRect(0, 0, w, h);
+  inkCtx.lineCap = inkCtx.lineJoin = "round";
+  for (const [id, s] of strokes) {
+    const age = now - s.t;
+    if (age > INK_HOLD + INK_FADE) { strokes.delete(id); continue; }
+    const alpha = age < INK_HOLD ? 1 : 1 - (age - INK_HOLD) / INK_FADE;
+    inkCtx.beginPath();
+    s.pts.forEach(([x, y], i) => i ? inkCtx.lineTo(x * w, y * h) : inkCtx.moveTo(x * w, y * h));
+    if (s.pts.length === 1) inkCtx.lineTo(s.pts[0][0] * w + 0.01, s.pts[0][1] * h);
+    // dark halo first so ink reads on both light and dark slides
+    inkCtx.globalAlpha = alpha * 0.35; inkCtx.strokeStyle = "#000"; inkCtx.lineWidth = lw * 1.8;
+    inkCtx.stroke();
+    inkCtx.globalAlpha = alpha; inkCtx.strokeStyle = s.color; inkCtx.lineWidth = lw;
+    inkCtx.stroke();
+  }
+  inkCtx.globalAlpha = 1;
+  if (strokes.size) inkRaf = requestAnimationFrame(drawInk);
+}
+function scheduleInk() { if (!inkRaf) inkRaf = requestAnimationFrame(drawInk); }
+function addInk({ id, color, pts }) {
+  let s = strokes.get(id);
+  if (!s) strokes.set(id, s = { color, pts: [] });
+  s.pts.push(...pts);
+  s.t = performance.now();
+  scheduleInk();
+}
+function clearInk() { strokes.clear(); scheduleInk(); }
+function sizeInk(vp) {
+  inkCanvas.width = vp.width; inkCanvas.height = vp.height;   // also clears; redraw
+  scheduleInk();
+}
+
 async function renderMain(n) {
   const page = await pdfDoc.getPage(n);
   const dpr = window.devicePixelRatio || 1;
@@ -117,6 +169,7 @@ async function renderMain(n) {
   mainCanvas.width = vp.width; mainCanvas.height = vp.height;
   mainCanvas.style.width = vp.width / dpr + "px";
   mainCanvas.style.height = vp.height / dpr + "px";
+  sizeInk(vp);
   if (renderTask) renderTask.cancel();
   renderTask = page.render({ canvasContext: mainCtx, viewport: vp });
   try { await renderTask.promise; } catch (e) {}
@@ -125,6 +178,7 @@ async function renderMain(n) {
 function setPage(n, who) {
   if (!pdfDoc) return;
   n = Math.max(1, Math.min(n, pdfDoc.numPages));
+  if (n !== currentPage) clearInk();
   currentPage = n;
   renderMain(n);
   counterEl.innerHTML = "<b>" + n + "</b> / " + pdfDoc.numPages;
@@ -138,10 +192,12 @@ function setPage(n, who) {
   }
 }
 
-const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY,
+  { realtime: { params: { eventsPerSecond: 30 } } });
 const channel = sb.channel("deck:" + room, { config: { broadcast: { self: false } } });
 
 function go(n) {
+  endStroke();
   setPage(n, myName);
   channel.send({ type: "broadcast", event: "goto",
     payload: { page: currentPage, who: myName } });
@@ -149,6 +205,9 @@ function go(n) {
 
 channel
   .on("broadcast", { event: "goto" }, ({ payload }) => setPage(payload.page, payload.who))
+  .on("broadcast", { event: "ink" }, ({ payload }) => {
+    if (payload.page === currentPage) addInk(payload);
+  })
   .on("broadcast", { event: "sync-request" }, () => {
     // any controller answers; identical answers are harmless
     channel.send({ type: "broadcast", event: "goto",
@@ -176,11 +235,59 @@ async function buildThumbs() {
   }
 }
 
+// ── Drawing: one color per presenter, points batched to stay under rate limits ──
+const INK_SEND_MS = 60;
+const myColor = "hsl(" + [...myName].reduce((h, ch) => (h * 31 + ch.codePointAt(0)) >>> 0, 7) % 360 + " 95% 58%)";
+document.documentElement.style.setProperty("--pen", myColor);
+const penBtn = document.getElementById("pen");
+let penOn = false, myStroke = null, pending = [], flushTimer = null, strokeSeq = 0;
+
+function setPen(on) {
+  penOn = on;
+  penBtn.classList.toggle("on", on);
+  penBtn.setAttribute("aria-pressed", on);
+  inkCanvas.classList.toggle("armed", on);
+  if (!on) endStroke();
+}
+penBtn.onclick = () => setPen(!penOn);
+
+function flushInk() {
+  clearTimeout(flushTimer); flushTimer = null;
+  if (!pending.length) return;
+  channel.send({ type: "broadcast", event: "ink",
+    payload: { page: currentPage, id: myStroke, color: myColor, pts: pending } });
+  pending = [];
+}
+function inkPoint(e) {
+  const r = inkCanvas.getBoundingClientRect();
+  const p = [+((e.clientX - r.left) / r.width).toFixed(4), +((e.clientY - r.top) / r.height).toFixed(4)];
+  addInk({ id: myStroke, color: myColor, pts: [p] });
+  pending.push(p);
+  if (!flushTimer) flushTimer = setTimeout(flushInk, INK_SEND_MS);
+}
+function endStroke() {
+  if (!myStroke) return;
+  flushInk();
+  myStroke = null;
+}
+inkCanvas.addEventListener("pointerdown", (e) => {
+  if (!penOn || !pdfDoc || e.button !== 0) return;
+  e.preventDefault();
+  inkCanvas.setPointerCapture(e.pointerId);
+  endStroke();
+  myStroke = myName + ":" + Date.now().toString(36) + ":" + strokeSeq++;
+  inkPoint(e);
+});
+inkCanvas.addEventListener("pointermove", (e) => { if (myStroke) inkPoint(e); });
+inkCanvas.addEventListener("pointerup", endStroke);
+inkCanvas.addEventListener("pointercancel", endStroke);
+
 document.getElementById("prev").onclick = () => go(currentPage - 1);
 document.getElementById("next").onclick = () => go(currentPage + 1);
 addEventListener("keydown", (e) => {
   if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") go(currentPage + 1);
   if (e.key === "ArrowLeft" || e.key === "PageUp") go(currentPage - 1);
+  if (e.key === "d" || e.key === "D") setPen(!penOn);
 });
 </script>
 </body>

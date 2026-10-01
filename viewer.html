@@ -7,6 +7,9 @@
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #stage { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
   canvas { max-width: 100vw; max-height: 100vh; }
+  #sheet { position: relative; }
+  #sheet canvas { display: block; }
+  #ink { position: absolute; inset: 0; width: 100%; height: 100%; }
   #status {
     position: fixed; bottom: 12px; right: 16px;
     font: 12px/1 ui-monospace, monospace; color: #444;
@@ -15,7 +18,7 @@
 </style>
 </head>
 <body>
-<div id="stage"><canvas id="pdf"></canvas></div>
+<div id="stage"><div id="sheet"><canvas id="pdf"></canvas><canvas id="ink"></canvas></div></div>
 <div id="status">connecting…</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
@@ -42,9 +45,53 @@ let pdfDoc = null;
 let currentPage = 1;
 let renderTask = null;
 
+// ── Ink overlay: fading strokes, coordinates normalized 0..1 ──
+const INK_HOLD = 2500, INK_FADE = 1000;   // ms visible, then ms fading out
+const inkCanvas = document.getElementById("ink");
+const inkCtx = inkCanvas.getContext("2d");
+const strokes = new Map();                // id -> { color, pts, t }
+let inkRaf = null;
+
+function drawInk() {
+  inkRaf = null;
+  const now = performance.now();
+  const w = inkCanvas.width, h = inkCanvas.height, lw = h * 0.006;
+  inkCtx.clearRect(0, 0, w, h);
+  inkCtx.lineCap = inkCtx.lineJoin = "round";
+  for (const [id, s] of strokes) {
+    const age = now - s.t;
+    if (age > INK_HOLD + INK_FADE) { strokes.delete(id); continue; }
+    const alpha = age < INK_HOLD ? 1 : 1 - (age - INK_HOLD) / INK_FADE;
+    inkCtx.beginPath();
+    s.pts.forEach(([x, y], i) => i ? inkCtx.lineTo(x * w, y * h) : inkCtx.moveTo(x * w, y * h));
+    if (s.pts.length === 1) inkCtx.lineTo(s.pts[0][0] * w + 0.01, s.pts[0][1] * h);
+    // dark halo first so ink reads on both light and dark slides
+    inkCtx.globalAlpha = alpha * 0.35; inkCtx.strokeStyle = "#000"; inkCtx.lineWidth = lw * 1.8;
+    inkCtx.stroke();
+    inkCtx.globalAlpha = alpha; inkCtx.strokeStyle = s.color; inkCtx.lineWidth = lw;
+    inkCtx.stroke();
+  }
+  inkCtx.globalAlpha = 1;
+  if (strokes.size) inkRaf = requestAnimationFrame(drawInk);
+}
+function scheduleInk() { if (!inkRaf) inkRaf = requestAnimationFrame(drawInk); }
+function addInk({ id, color, pts }) {
+  let s = strokes.get(id);
+  if (!s) strokes.set(id, s = { color, pts: [] });
+  s.pts.push(...pts);
+  s.t = performance.now();
+  scheduleInk();
+}
+function clearInk() { strokes.clear(); scheduleInk(); }
+function sizeInk(vp) {
+  inkCanvas.width = vp.width; inkCanvas.height = vp.height;   // also clears; redraw
+  scheduleInk();
+}
+
 async function renderPage(n) {
   if (!pdfDoc) return;
   n = Math.max(1, Math.min(n, pdfDoc.numPages));
+  if (n !== currentPage) clearInk();
   currentPage = n;
   const page = await pdfDoc.getPage(n);
   const dpr = window.devicePixelRatio || 1;
@@ -55,6 +102,7 @@ async function renderPage(n) {
   canvas.height = vp.height;
   canvas.style.width = vp.width / dpr + "px";
   canvas.style.height = vp.height / dpr + "px";
+  sizeInk(vp);
   if (renderTask) renderTask.cancel();
   renderTask = page.render({ canvasContext: ctx, viewport: vp });
   try { await renderTask.promise; } catch (e) { /* cancelled mid-render */ }
@@ -69,6 +117,9 @@ channel
   .on("broadcast", { event: "goto" }, ({ payload }) => {
     renderPage(payload.page);
     statusEl.textContent = "";
+  })
+  .on("broadcast", { event: "ink" }, ({ payload }) => {
+    if (payload.page === currentPage) addInk(payload);
   })
   .subscribe(async (state) => {
     if (state !== "SUBSCRIBED") return;

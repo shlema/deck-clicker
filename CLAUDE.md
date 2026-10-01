@@ -30,10 +30,11 @@ Both files load pdf.js and supabase-js from CDNs and share the same pattern:
 2. Subscribe to Supabase channel `deck:<room>` with `broadcast: { self: false }`.
 3. Render PDF pages to `<canvas>` via pdf.js, scaled by `devicePixelRatio`.
 
-Sync protocol (two broadcast events only):
+Sync protocol (three broadcast events):
 
 - `goto` `{ page, who }` — sent by a controller on any navigation; both viewer and other controllers re-render to that page. Last click wins.
 - `sync-request` `{}` — sent by any client on subscribe; any live controller answers with a `goto` carrying its current page so late joiners catch up.
+- `ink` `{ page, id, color, pts: [[x,y],…] }` — drawing, sent by a controller in pen mode (✎ DRAW button or `D` key). Points are normalized 0..1 to the page, batched every 60ms, and appended to stroke `id`. Receivers ignore ink for pages they aren't showing. Strokes fade out on their own (visible 2.5s after their last point, then a 1s fade), are cleared locally on page change, and are never replayed to late joiners. Color is derived from the presenter's `name`.
 
 The controller additionally tracks "who is driving" (`driver` label + red tally dot when it's you, auto-clearing after 5s) and renders a clickable thumbnail strip.
 
